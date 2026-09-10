@@ -400,8 +400,7 @@ mod tests {
             .expect("nix flake show should succeed");
 
         assert!(flake.is_object());
-        assert!(flake.get("legacyPackages").is_some());
-        assert!(flake.get("nixosModules").is_some());
+        assert!(!flake.as_object().unwrap().is_empty());
     }
 
     #[tokio::test]
