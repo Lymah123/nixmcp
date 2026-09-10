@@ -9,7 +9,8 @@ use crate::{
     clients::nix::NixClient,
     tools::{
         get_option::GetOptionRequest, get_package::GetPackageRequest,
-        inspect_flake::InspectFlakeRequest, search_packages::SearchPackagesRequest,
+        inspect_flake::InspectFlakeRequest, search_options::SearchOptionsRequest,
+        search_packages::SearchPackagesRequest,
     },
 };
 
@@ -79,6 +80,21 @@ impl NixMcpServer {
 
         serde_json::to_string(&flake)
             .map_err(|error| format!("Failed to serialize flake information: {error}"))
+    }
+
+    /// Search NixOS configuration options by name or path.
+    #[tool(
+        name = "search_options",
+        description = "Search NixOS configuration options by name or path."
+    )]
+    pub async fn search_options(
+        &self,
+        Parameters(SearchOptionsRequest { query }): Parameters<SearchOptionsRequest>,
+    ) -> Result<String, String> {
+        let options = self.nix_client.search_options(&query).await?;
+
+        serde_json::to_string(&options)
+            .map_err(|error| format!("Failed to serialize option search results: {error}"))
     }
 
     /// Get metadata about a NixOS configuration option.
@@ -242,6 +258,49 @@ mod mcp_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn search_options_mcp_call_works() -> anyhow::Result<()> {
+        let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
+
+        let server = NixMcpServer::new();
+
+        let server_handle = tokio::spawn(async move {
+            server.serve(server_transport).await?.waiting().await?;
+
+            anyhow::Ok(())
+        });
+
+        let client = TestClient.serve(client_transport).await?;
+
+        let result = client
+            .call_tool(
+                rmcp::model::CallToolRequestParams::new("search_options").with_arguments(
+                    serde_json::json!({
+                        "query": "services.postgresql.enable"
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            )
+            .await?;
+
+        let text = result
+            .content
+            .first()
+            .and_then(|content| content.as_text())
+            .map(|text| text.text.as_str())
+            .expect("Expected text content");
+
+        println!("MCP response: {text}");
+        assert!(text.contains("\"path\":\"services.postgresql.enable\""));
+        assert!(text.contains("Whether to enable PostgreSQL Server."));
+
+        client.cancel().await?;
+        server_handle.await??;
+
+        Ok(())
+    }
     #[tokio::test]
     async fn get_package_mcp_call_works() -> anyhow::Result<()> {
         let (server_transport, client_transport) = tokio::io::duplex(16 * 1024);
