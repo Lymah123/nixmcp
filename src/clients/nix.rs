@@ -39,25 +39,108 @@ impl NixClient {
 
     /// Get information about a specific Nix package.
     pub async fn get_package(&self, attribute: &str) -> Result<Package, String> {
-        let pname = self
-            .eval_string(&format!("nixpkgs#{attribute}.pname"))
-            .await?;
+        let expression = r#"
+let
+  nixpkgs = builtins.getFlake "nixpkgs";
+  attribute = builtins.getEnv "NIXMCP_ATTRIBUTE";
+  parts = nixpkgs.lib.splitString "." attribute;
 
-        let version = self
-            .eval_string(&format!("nixpkgs#{attribute}.version"))
-            .await?;
+  package = builtins.foldl'
+    (value: part: builtins.getAttr part value)
+    nixpkgs.legacyPackages.x86_64-linux
+    parts;
 
-        let description = self
-            .eval_string(&format!("nixpkgs#{attribute}.meta.description"))
+in
+{
+  pname = package.pname;
+  version = package.version;
+  description = package.meta.description or null;
+}
+"#;
+
+        let output = Command::new("nix")
+            .env("NIXMCP_ATTRIBUTE", attribute)
+            .args(["eval", "--json", "--impure", "--expr", expression])
+            .output()
             .await
-            .ok();
+            .map_err(|error| format!("Failed to execute nix: {error}"))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+
+            return Err(format!(
+                "nix package evaluation failed with status {}: {}",
+                output.status,
+                stderr.trim()
+            ));
+        }
+
+        #[derive(Debug, Deserialize)]
+        struct PackageMetadata {
+            pname: String,
+            version: String,
+            description: Option<String>,
+        }
+
+        let metadata: PackageMetadata = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("Failed to parse Nix package output: {error}"))?;
 
         Ok(Package {
             attribute: attribute.to_string(),
-            pname,
-            version,
-            description,
+            pname: metadata.pname,
+            version: metadata.version,
+            description: metadata.description,
         })
+    }
+
+    pub async fn search_options(&self, query: &str) -> Result<Vec<NixosOption>, String> {
+        let expression = r#"
+let
+  nixpkgs = builtins.getFlake "nixpkgs";
+  query = builtins.getEnv "NIXMCP_QUERY";
+
+  system = nixpkgs.lib.nixosSystem {
+    system = "x86_64-linux";
+    modules = [];
+  };
+
+  options = nixpkgs.lib.optionAttrSetToDocList system.options;
+
+  matches = builtins.filter
+    (option:
+      nixpkgs.lib.hasInfix query option.name
+    )
+    options;
+
+in
+  nixpkgs.lib.take 20 matches
+"#;
+
+        let output = Command::new("nix")
+            .env("NIXMCP_QUERY", query)
+            .args(["eval", "--json", "--impure", "--expr", expression])
+            .output()
+            .await
+            .map_err(|error| format!("failed to execute nix: {error}"))?;
+
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).to_string());
+        }
+
+        let options: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout)
+            .map_err(|error| format!("failed to parse nix output: {error}"))?;
+
+        options
+            .into_iter()
+            .map(|option| {
+                Ok(NixosOption {
+                    path: option["name"].as_str().unwrap_or_default().to_string(),
+                    option_type: option["type"].as_str().map(String::from),
+                    description: option["description"].as_str().map(String::from),
+                    default: option.get("default").cloned(),
+                })
+            })
+            .collect()
     }
 
     pub async fn get_option(&self, path: &str) -> Result<NixosOption, String> {
@@ -123,30 +206,6 @@ impl NixClient {
 
         serde_json::from_str(&stdout)
             .map_err(|error| format!("Failed to parse nix flake output: {error}"))
-    }
-
-    async fn eval_string(&self, expression: &str) -> Result<String, String> {
-        let output = Command::new("nix")
-            .args(["eval", expression, "--json"])
-            .output()
-            .await
-            .map_err(|error| format!("Failed to execute nix: {error}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-
-            return Err(format!(
-                "nix eval failed with status {}: {}",
-                output.status,
-                stderr.trim()
-            ));
-        }
-
-        let stdout = String::from_utf8(output.stdout)
-            .map_err(|error| format!("Nix returned invalid UTF-8: {error}"))?;
-
-        serde_json::from_str(&stdout)
-            .map_err(|error| format!("Failed to parse nix eval output: {error}"))
     }
 }
 
@@ -230,15 +289,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_eval_string() {
-        let input = r#""ripgrep""#;
-
-        let value: String = serde_json::from_str(input).expect("expected valid JSON string");
-
-        assert_eq!(value, "ripgrep");
-    }
-
     #[tokio::test]
     async fn gets_real_package() {
         let client = NixClient::new();
@@ -257,6 +307,19 @@ mod tests {
                 "Utility that combines the usability of The Silver Searcher with the raw speed of grep"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn gets_real_nested_package() {
+        let client = NixClient::new();
+
+        let package = client
+            .get_package("python3Packages.requests")
+            .await
+            .expect("nix eval should succeed");
+
+        assert_eq!(package.attribute, "python3Packages.requests");
+        assert_eq!(package.pname, "requests");
     }
 
     #[tokio::test]
@@ -325,6 +388,32 @@ mod tests {
         );
         assert_eq!(option.option_type.as_deref(), Some("bool"));
         assert_eq!(option.default, Some(serde_json::json!(false)));
+    }
+
+    #[tokio::test]
+    async fn inspects_real_flake() {
+        let client = NixClient::new();
+
+        let flake = client
+            .inspect_flake("nixpkgs")
+            .await
+            .expect("nix flake show should succeed");
+
+        assert!(flake.is_object());
+        assert!(flake.get("legacyPackages").is_some());
+        assert!(flake.get("nixosModules").is_some());
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_flake() {
+        let client = NixClient::new();
+
+        let result = client
+            .inspect_flake("github:does-not-exist/nixmcp-invalid-flake")
+            .await;
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("nix flake show failed"));
     }
 
     #[tokio::test]
